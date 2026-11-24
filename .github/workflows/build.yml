@@ -1,0 +1,108 @@
+# Monta e publica o Qobe CRM para Windows. Roda neste repositório PÚBLICO (Actions grátis); o código-fonte vem do
+# repositório privado Cast4nha/qobe-crm por uma chave só de leitura (secret DEPLOY_KEY) e nunca é publicado aqui —
+# só o instalador, a assinatura da atualização (.sig) e o latest.json vão para a Release.
+#
+# Disparo: aba Actions → "Publicar versão" → Run workflow (versão X.Y.Z e a branch/tag do qobe-crm).
+# Secrets: DEPLOY_KEY, TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD. Variável: TAURI_UPDATER_PUBKEY.
+
+name: Publicar versão
+
+on:
+  workflow_dispatch:
+    inputs:
+      versao:
+        description: "Versão (ex.: 0.1.0) — tem que ser maior que a última publicada para os PCs atualizarem"
+        required: true
+      ref:
+        description: "Branch ou tag do qobe-crm"
+        required: true
+        default: feat/app-windows
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+jobs:
+  instalador:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: src/apps/windows
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+      VERSAO: ${{ inputs.versao }}
+    steps:
+      - name: Código do qobe-crm (privado, só leitura)
+        uses: actions/checkout@v4
+        with:
+          repository: Cast4nha/qobe-crm
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          path: src
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src/apps/windows/src-tauri -> target
+
+      - name: Dependências
+        run: npm ci
+
+      - name: Configuração da atualização automática
+        run: |
+          test -n "$TAURI_SIGNING_PRIVATE_KEY" && test -n "$TAURI_UPDATER_PUBKEY" || { echo "Faltam a chave e a variável da atualização"; exit 1; }
+          cp src-tauri/extras/atualizacao.json src-tauri/capabilities/atualizacao.json
+          node -e "
+            const fs = require('fs');
+            const c = JSON.parse(fs.readFileSync('src-tauri/extras/tauri.atualizacao.conf.json', 'utf8'));
+            c.plugins.updater.pubkey = process.env.TAURI_UPDATER_PUBKEY;
+            c.plugins.updater.endpoints = ['https://github.com/${{ github.repository }}/releases/latest/download/latest.json'];
+            fs.writeFileSync('src-tauri/tauri.atualizacao.gerado.json', JSON.stringify(c));
+          "
+
+      - name: Montar (instalador NSIS assinado para atualização)
+        run: npm run tauri build -- --bundles nsis --features atualizacao --config "{\"version\":\"$VERSAO\"}" --config src-tauri/tauri.atualizacao.gerado.json
+
+      - name: Separar arquivos e latest.json
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/saida"
+          exe="$(ls src-tauri/target/release/bundle/nsis/*-setup.exe | head -n1)"
+          arq="Qobe-CRM_${VERSAO}_x64-setup.exe"
+          cp "$exe" "$GITHUB_WORKSPACE/saida/$arq"
+          cp "$exe.sig" "$GITHUB_WORKSPACE/saida/$arq.sig"
+          node -e "
+            const fs = require('fs');
+            const dir = process.env.GITHUB_WORKSPACE + '/saida/';
+            const arq = 'Qobe-CRM_' + process.env.VERSAO + '_x64-setup.exe';
+            fs.writeFileSync(dir + 'latest.json', JSON.stringify({
+              version: process.env.VERSAO,
+              notes: 'Qobe CRM ' + process.env.VERSAO,
+              pub_date: new Date().toISOString(),
+              platforms: { 'windows-x86_64': {
+                signature: fs.readFileSync(dir + arq + '.sig', 'utf8'),
+                url: 'https://github.com/${{ github.repository }}/releases/download/v' + process.env.VERSAO + '/' + arq,
+              } },
+            }, null, 2));
+          "
+          ls -la "$GITHUB_WORKSPACE/saida"
+
+      - name: Publicar a versão
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.versao }}
+          name: Qobe CRM ${{ inputs.versao }}
+          make_latest: true
+          files: ${{ github.workspace }}/saida/*
+          fail_on_unmatched_files: true
